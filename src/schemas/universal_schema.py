@@ -1,182 +1,89 @@
 """
-Schema definitions for WhatsApp chat data transformation.
-Uses simple Python dictionaries and JSON for data validation and serialization.
+Data schemas for Universal User Embeddings training.
 """
 
-from typing import List, Dict, Any, Literal, TypedDict
+from dataclasses import dataclass
+from typing import List, Optional, Dict, Any
 from datetime import datetime
-import json
 
 
-class MessageContent(TypedDict):
-    """Represents a single message in a conversation."""
-    speaker: Literal["SELF", "OTHER"]  # Indicates whether the message is from the user (SELF) or another person (OTHER)
-    text: str  # The actual message text content
+@dataclass
+class UserChunk:
+    """Represents a single chunk of user data."""
+    text: str
+    platform: str
+    timestamp: Optional[datetime] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 
-class ChatChunk(TypedDict):
-    """Represents a chunk of conversation from a specific platform."""
-    user_id: str  # Unique identifier for the user
-    chunk_id: str  # Unique identifier for this conversation chunk
-    platform: str  # The platform where the conversation took place (e.g., 'whatsapp', 'reddit')
-    content: List[MessageContent]  # List of messages in this conversation chunk
-    timestamp: str  # Timestamp when this conversation chunk was created or processed (ISO format)
+@dataclass
+class UserData:
+    """Represents a user's complete data history."""
+    user_id: str
+    chunks: List[UserChunk]
+    statements: List[str]  # Positive statements about this user
+    metadata: Optional[Dict[str, Any]] = None
 
 
-def validate_message_content(message: Dict[str, Any]) -> MessageContent:
-    """
-    Validate a message content dictionary against the schema.
+@dataclass
+class StatementData:
+    """Represents a behavioral statement with optional context."""
+    statement: str
+    context: Optional[str] = None
+    category: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class TrainingExample:
+    """A training example with user data and positive/negative statements."""
+    user_data: UserData
+    positive_statement: str
+    negative_statements: List[str]
+    context: Optional[str] = None
+
+
+@dataclass
+class BatchData:
+    """Batch data for training."""
+    user_ids: List[str]
+    user_texts: List[List[str]]  # List of chunks per user
+    positive_statements: List[str]
+    negative_statements: List[List[str]]  # List of negative statements per user
+    contexts: Optional[List[str]] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class ModelConfig:
+    """Configuration for the Universal User Embeddings model."""
+    # Model architecture
+    base_model_name: str = "Qwen/Qwen3-Embedding-0.6B"
+    embedding_dim: int = 1024  # Qwen3-Embedding-0.6B output dimension
+    max_chunk_length: int = 250
+    max_statement_length: int = 128
+    max_context_length: int = 64
     
-    Args:
-        message: Dictionary containing message data
-        
-    Returns:
-        Validated MessageContent dictionary
-        
-    Raises:
-        ValueError: If validation fails
-    """
-    if not isinstance(message, dict):
-        raise ValueError("Message must be a dictionary")
-        
-    if "speaker" not in message:
-        raise ValueError("Message must have a 'speaker' field")
+    # Training parameters
+    batch_size: int = 32
+    learning_rate: float = 2e-5
+    temperature: float = 0.1
+    num_epochs: int = 10
+    warmup_steps: int = 1000
+    weight_decay: float = 0.01
     
-    if message["speaker"] not in ["SELF", "OTHER"]:
-        raise ValueError("Speaker must be either 'SELF' or 'OTHER'")
-        
-    if "text" not in message:
-        raise ValueError("Message must have a 'text' field")
-        
-    if not isinstance(message["text"], str):
-        raise ValueError("Message text must be a string")
-        
-    return {
-        "speaker": message["speaker"],
-        "text": message["text"]
-    }
-
-
-def validate_chat_chunk(chunk: Dict[str, Any]) -> ChatChunk:
-    """
-    Validate a chat chunk dictionary against the schema.
+    # Data processing
+    num_chunks_per_user: int = 100
+    num_negative_samples: int = 15
+    chunk_overlap: int = 50
     
-    Args:
-        chunk: Dictionary containing chat chunk data
-        
-    Returns:
-        Validated ChatChunk dictionary
-        
-    Raises:
-        ValueError: If validation fails
-    """
-    if not isinstance(chunk, dict):
-        raise ValueError("Chat chunk must be a dictionary")
-        
-    required_fields = ["user_id", "chunk_id", "platform", "content", "timestamp"]
-    for field in required_fields:
-        if field not in chunk:
-            raise ValueError(f"Chat chunk must have a '{field}' field")
-            
-    if not isinstance(chunk["user_id"], str):
-        raise ValueError("user_id must be a string")
-        
-    if not isinstance(chunk["chunk_id"], str):
-        raise ValueError("chunk_id must be a string")
-        
-    if not isinstance(chunk["platform"], str):
-        raise ValueError("platform must be a string")
-        
-    if not isinstance(chunk["content"], list):
-        raise ValueError("content must be a list")
-        
-    # Validate each message in the content list
-    validated_content = [validate_message_content(msg) for msg in chunk["content"]]
+    # Architecture specific
+    use_attention_pooling: bool = True
+    attention_heads: int = 8
+    dropout: float = 0.1
     
-    # Validate timestamp format
-    if not isinstance(chunk["timestamp"], str):
-        raise ValueError("timestamp must be a string in ISO format")
-    
-    # Try to parse the timestamp to ensure it's valid
-    try:
-        datetime.fromisoformat(chunk["timestamp"].replace('Z', '+00:00'))
-    except ValueError:
-        raise ValueError("timestamp must be a valid ISO format datetime string")
-        
-    return {
-        "user_id": chunk["user_id"],
-        "chunk_id": chunk["chunk_id"],
-        "platform": chunk["platform"],
-        "content": validated_content,
-        "timestamp": chunk["timestamp"]
-    }
-
-
-def serialize_chat_chunks(chat_chunks: List[ChatChunk]) -> str:
-    """
-    Serialize a list of chat chunks to JSON.
-    
-    Args:
-        chat_chunks: List of validated ChatChunk dictionaries
-        
-    Returns:
-        JSON string representation
-    """
-    return json.dumps(chat_chunks, indent=2)
-
-
-def deserialize_chat_chunks(json_str: str) -> List[ChatChunk]:
-    """
-    Deserialize a JSON string to a list of chat chunks.
-    
-    Args:
-        json_str: JSON string representation
-        
-    Returns:
-        List of validated ChatChunk dictionaries
-    """
-    data = json.loads(json_str)
-    return [validate_chat_chunk(chunk) for chunk in data]
-
-
-# Example of how to use the schema
-if __name__ == "__main__":
-    # Example data
-    example_data = [
-        {
-            "user_id": "usr_042",
-            "chunk_id": "conv_8423#05",
-            "platform": "reddit",
-            "content": [
-                {"speaker": "SELF", "text": "Because most people just want things to work out of the box."}
-            ],
-            "timestamp": "2025-06-17T18:34:20Z"
-        },
-        {
-            "user_id": "usr_023",
-            "chunk_id": "conv_8423#07",
-            "platform": "whatsapp",
-            "content": [
-                {"speaker": "SELF", "text": "Just a small project."},
-                {"speaker": "OTHER", "text": "Cool, what's it about?"},
-                {"speaker": "SELF", "text": "It's a small project."}
-            ],
-            "timestamp": "2025-06-17T18:34:20Z"
-        }
-    ]
-    
-    # Validate the data
-    validated_chunks = [validate_chat_chunk(chunk) for chunk in example_data]
-    
-    # Serialize to JSON
-    json_str = serialize_chat_chunks(validated_chunks)
-    print(json_str)
-    
-    # Deserialize from JSON
-    deserialized_chunks = deserialize_chat_chunks(json_str)
-    
-    # You can now work with the validated data
-    for chunk in deserialized_chunks:
-        print(f"User {chunk['user_id']} on {chunk['platform']}:")
-        for message in chunk["content"]:
-            print(f"  [{message['speaker']}]: {message['text']}")
+    # Logging and evaluation
+    eval_steps: int = 500
+    save_steps: int = 1000
+    logging_steps: int = 100
+    eval_batch_size: int = 64

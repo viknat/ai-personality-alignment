@@ -1,15 +1,24 @@
 [tool.poetry]
 name = "ai-personality-alignment"
 version = "0.1.0"
-description = "Tools for transforming and analyzing WhatsApp chat data for personality alignment research"
+description = "Universal User Embeddings: Contrastive Learning for User Representation"
 authors = ["Your Name <your.email@example.com>"]
 readme = "README.md"
-packages = [{include = "schemas", from = "src"}, {include = "transformers", from = "src"}]
+packages = [{include = "schemas", from = "src"}, {include = "transformers", from = "src"}, {include = "train", from = "src"}, {include = "utils", from = "src"}]
 
 [tool.poetry.dependencies]
 python = "^3.9.7"
-lxml = "^4.9.3"  # Better XML handling than the standard library
-huggingface-hub = "^0.19.0"  # For uploading datasets to Hugging Face Hub
+torch = "^2.1.0"
+transformers = ">=4.53.0"
+datasets = "^2.16.0"
+accelerate = "^0.25.0"
+wandb = "^0.16.0"
+tqdm = "^4.66.0"
+numpy = "^1.24.0"
+scikit-learn = "^1.3.0"
+pandas = "^2.1.0"
+lxml = "^4.9.3"
+huggingface-hub = "^0.30.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.0"
@@ -24,6 +33,7 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry.scripts]
 transform-whatsapp = "transformers.whatsapp:main"
+train-uue = "train.trainer:main"
 
 [tool.black]
 line-length = 88
