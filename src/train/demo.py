@@ -1,307 +1,324 @@
 """
-Demo Script for Universal User Embeddings.
+Demo script for Universal User Embeddings with Two-Tower Architecture.
 
-This script demonstrates the complete training and evaluation pipeline
-for the Universal User Embeddings model.
+This script demonstrates the complete pipeline:
+1. Training a two-tower model with separate user and item towers
+2. Evaluating the model performance
+3. Demonstrating inference capabilities
+4. Showing statement similarity analysis
+5. Generating a comprehensive report
 """
 
 import torch
 import numpy as np
-from pathlib import Path
-import json
 from typing import List, Dict, Any
+import logging
+from pathlib import Path
 
 from .trainer import UniversalUserEmbeddingTrainer
-from .evaluation import UniversalUserEmbeddingEvaluator, create_evaluation_report
+from .evaluation import UniversalUserEmbeddingEvaluator
 from .data_loader import create_sample_data, create_evaluation_data
 from ..schemas.universal_schema import ModelConfig, UserData
 
 
-def run_training_demo():
-    """Run a complete training demo."""
-    print("=" * 60)
-    print("UNIVERSAL USER EMBEDDINGS - TRAINING DEMO")
-    print("=" * 60)
+def run_two_tower_demo():
+    """
+    Run the complete two-tower demo pipeline.
     
-    # Create configuration
+    This demonstrates:
+    - Training with separate user and item towers
+    - Evaluation with comprehensive metrics
+    - Inference capabilities
+    - Similarity analysis
+    """
+    print("="*60)
+    print("UNIVERSAL USER EMBEDDINGS - TWO-TOWER DEMO")
+    print("="*60)
+    
+    # Setup logging
+    logging.basicConfig(level=logging.INFO)
+    
+    # Create configuration for two-tower model
     config = ModelConfig(
-        base_model_name="intfloat/e5-base-v2",
-        embedding_dim=768,
-        batch_size=8,  # Smaller batch size for demo
+        # Two-tower configuration
+        user_model_name="Qwen/Qwen3-Embedding-0.6B",
+        item_model_name="Qwen/Qwen3-Embedding-0.6B",
+        embedding_dim=1024,
+        
+        # Training parameters
+        batch_size=16,  # Smaller batch for demo
         learning_rate=2e-5,
         temperature=0.1,
-        num_epochs=3,  # Few epochs for demo
-        eval_steps=50,
-        save_steps=100,
-        logging_steps=10,
-        num_negative_samples=5
+        num_epochs=3,  # Fewer epochs for demo
+        
+        # Data processing
+        num_chunks_per_user=50,
+        num_negative_samples=10,
+        
+        # Architecture specific
+        use_attention_pooling=True,
+        attention_heads=8,
+        dropout=0.1,
+        
+        # Metadata support
+        use_user_metadata=True,
+        use_item_metadata=True,
+        metadata_dim=32,
+        item_metadata_dim=32,
+        
+        # Logging
+        eval_steps=100,
+        save_steps=200,
+        logging_steps=50
     )
     
-    print(f"Configuration:")
-    print(f"  Base Model: {config.base_model_name}")
+    print(f"\nConfiguration:")
+    print(f"  User Tower: {config.user_model_name}")
+    print(f"  Item Tower: {config.item_model_name}")
     print(f"  Embedding Dimension: {config.embedding_dim}")
     print(f"  Batch Size: {config.batch_size}")
     print(f"  Learning Rate: {config.learning_rate}")
     print(f"  Temperature: {config.temperature}")
     print(f"  Epochs: {config.num_epochs}")
     
-    # Create trainer
+    # Step 1: Create sample data
+    print("\n" + "="*40)
+    print("STEP 1: CREATING SAMPLE DATA")
+    print("="*40)
+    
+    train_data, statement_pool = create_sample_data(config)
+    eval_data, eval_statements = create_evaluation_data(config)
+    
+    print(f"Created {len(train_data)} training users")
+    print(f"Created {len(eval_data)} evaluation users")
+    print(f"Statement pool size: {len(statement_pool)}")
+    print(f"Evaluation statements: {len(eval_statements)}")
+    
+    # Step 2: Train the two-tower model
+    print("\n" + "="*40)
+    print("STEP 2: TRAINING TWO-TOWER MODEL")
+    print("="*40)
+    
     trainer = UniversalUserEmbeddingTrainer(
         config=config,
+        train_data=train_data,
+        eval_data=eval_data,
+        statement_pool=statement_pool,
         output_dir="./demo_outputs",
-        use_wandb=False  # Disable wandb for demo
+        use_wandb=False,  # Disable wandb for demo
+        use_mixed_precision=True
     )
     
-    print(f"\nTraining on {len(trainer.train_data)} users")
-    print(f"Evaluating on {len(trainer.eval_data)} users")
-    print(f"Statement pool size: {len(trainer.statement_pool)}")
-    
-    # Start training
-    print("\nStarting training...")
+    # Train the model
     trainer.train()
     
-    print("\nTraining completed!")
-    return trainer
-
-
-def run_evaluation_demo(trainer: UniversalUserEmbeddingTrainer):
-    """Run evaluation demo on the trained model."""
-    print("\n" + "=" * 60)
-    print("UNIVERSAL USER EMBEDDINGS - EVALUATION DEMO")
-    print("=" * 60)
+    # Step 3: Evaluate the model
+    print("\n" + "="*40)
+    print("STEP 3: EVALUATING TWO-TOWER MODEL")
+    print("="*40)
     
-    # Create evaluator
-    model_path = "./demo_outputs/best_model.pt"
+    model_path = "./demo_outputs/best_two_tower_model.pt"
     evaluator = UniversalUserEmbeddingEvaluator(model_path)
     
-    # Get test data
-    test_users, candidate_statements = create_evaluation_data(trainer.config)
-    
-    print(f"Evaluating on {len(test_users)} test users")
-    print(f"Testing with {len(candidate_statements)} candidate statements")
-    
-    # Run evaluations
-    print("\n1. Preference Retrieval Evaluation...")
-    retrieval_metrics = evaluator.evaluate_preference_retrieval(
-        test_users, candidate_statements, top_k=5
+    # Generate comprehensive evaluation report
+    report = evaluator.generate_evaluation_report(
+        test_users=eval_data,
+        candidate_statements=statement_pool,
+        test_statements=eval_statements
     )
-    print(f"   Precision@5: {retrieval_metrics['precision@k']:.4f}")
-    print(f"   Recall@5: {retrieval_metrics['recall@k']:.4f}")
-    print(f"   F1@5: {retrieval_metrics['f1@k']:.4f}")
     
-    print("\n2. Zero-shot Inference Evaluation...")
-    zero_shot_metrics = evaluator.evaluate_zero_shot_inference(
-        test_users, candidate_statements
-    )
-    print(f"   Precision: {zero_shot_metrics['precision']:.4f}")
-    print(f"   Recall: {zero_shot_metrics['recall']:.4f}")
-    print(f"   F1 Score: {zero_shot_metrics['f1_score']:.4f}")
-    print(f"   Best Threshold: {zero_shot_metrics['best_threshold']:.4f}")
+    # Step 4: Demonstrate inference capabilities
+    print("\n" + "="*40)
+    print("STEP 4: INFERENCE DEMONSTRATION")
+    print("="*40)
     
-    print("\n3. User Similarity Analysis...")
-    similarity_analysis = evaluator.analyze_user_similarities(test_users)
-    print(f"   Mean Similarity: {similarity_analysis['mean_similarity']:.4f}")
-    print(f"   Std Similarity: {similarity_analysis['std_similarity']:.4f}")
-    
-    # Show most similar user pairs
-    print("\n   Most Similar User Pairs:")
-    for i, (user1, user2, similarity) in enumerate(similarity_analysis['most_similar_pairs'][:3]):
-        print(f"     {i+1}. {user1} <-> {user2}: {similarity:.4f}")
-    
-    return evaluator
-
-
-def run_inference_demo(evaluator: UniversalUserEmbeddingEvaluator):
-    """Run inference demo with example users and statements."""
-    print("\n" + "=" * 60)
-    print("UNIVERSAL USER EMBEDDINGS - INFERENCE DEMO")
-    print("=" * 60)
-    
-    # Example users
-    example_users = [
-        {
-            "name": "Tech Enthusiast",
-            "chunks": [
-                "I love programming in Python and building machine learning models.",
-                "Just finished reading a paper on transformer architectures.",
-                "Working on a new AI project that uses deep learning for image recognition."
-            ]
-        },
-        {
-            "name": "Fitness Enthusiast", 
-            "chunks": [
-                "Had an amazing workout at the gym today! Deadlifts are my favorite.",
-                "Planning my meal prep for the week. Protein and vegetables are key.",
-                "Just completed a 10-mile run. Training for my next marathon."
-            ]
-        },
-        {
-            "name": "Art Lover",
-            "chunks": [
-                "Visited the modern art museum today. The contemporary exhibits were incredible.",
-                "Working on a new painting using acrylics. Abstract expressionism is my style.",
-                "Just finished reading a book about Renaissance artists. Da Vinci was truly ahead of his time."
-            ]
-        }
+    # Test user similarity
+    test_user_chunks = [
+        "I love programming and working on AI projects",
+        "Reading research papers about machine learning",
+        "Building neural networks and experimenting with new algorithms"
     ]
     
-    # Example statements to test
     test_statements = [
-        "interested in technology and programming",
-        "enjoys physical exercise and fitness",
-        "appreciates art and creativity",
-        "loves reading books",
+        "interested in technology",
+        "enjoys reading research papers",
+        "works on AI projects",
+        "loves programming",
+        "interested in machine learning",
         "enjoys outdoor activities",
-        "works in software development",
-        "goes to the gym regularly",
-        "paints or draws as a hobby"
+        "loves cooking",
+        "interested in sports"
     ]
     
-    print("Testing user-statement similarities:")
-    print("-" * 50)
+    print(f"\nTesting user: {test_user_chunks[0][:50]}...")
+    print("\nSimilarity scores with different statements:")
     
-    for user_info in example_users:
-        print(f"\n{user_info['name']}:")
-        user_chunks = user_info["chunks"]
-        
-        # Get user embedding
-        user_embedding = evaluator.get_user_embedding(user_chunks)
-        
-        # Test each statement
-        similarities = []
-        for statement in test_statements:
-            stmt_embedding = evaluator.get_statement_embedding(statement)
-            similarity = np.dot(user_embedding, stmt_embedding)
-            similarities.append((statement, similarity))
-        
-        # Sort by similarity
-        similarities.sort(key=lambda x: x[1], reverse=True)
-        
-        # Show top 3 most similar statements
-        print("  Top 3 most similar statements:")
-        for i, (statement, sim) in enumerate(similarities[:3]):
-            print(f"    {i+1}. {statement}: {sim:.4f}")
-        
-        # Show bottom 3 least similar statements
-        print("  Bottom 3 least similar statements:")
-        for i, (statement, sim) in enumerate(similarities[-3:]):
-            print(f"    {i+1}. {statement}: {sim:.4f}")
-
-
-def run_statement_similarity_demo(evaluator: UniversalUserEmbeddingEvaluator):
-    """Demo statement-to-statement similarities."""
-    print("\n" + "=" * 60)
-    print("UNIVERSAL USER EMBEDDINGS - STATEMENT SIMILARITY DEMO")
-    print("=" * 60)
+    similarities = []
+    for statement in test_statements:
+        similarity = evaluator.compute_similarity(test_user_chunks, statement)
+        similarities.append((statement, similarity))
+        print(f"  '{statement}': {similarity:.4f}")
     
-    # Example statement pairs
-    statement_pairs = [
-        ("loves programming", "enjoys coding"),
-        ("goes to the gym", "exercises regularly"),
-        ("loves programming", "goes to the gym"),  # Should be less similar
-        ("enjoys reading", "loves books"),
-        ("plays sports", "enjoys outdoor activities"),
-        ("works in tech", "programs software"),
-        ("loves cooking", "enjoys gardening"),  # Should be less similar
-        ("travels frequently", "loves exploring new places")
+    # Find most similar statements
+    similarities.sort(key=lambda x: x[1], reverse=True)
+    print(f"\nTop 3 most similar statements:")
+    for i, (statement, sim) in enumerate(similarities[:3], 1):
+        print(f"  {i}. '{statement}': {sim:.4f}")
+    
+    # Step 5: Statement similarity analysis
+    print("\n" + "="*40)
+    print("STEP 5: STATEMENT SIMILARITY ANALYSIS")
+    print("="*40)
+    
+    tech_statements = [
+        "interested in technology",
+        "loves programming",
+        "works on AI projects",
+        "interested in machine learning"
     ]
     
-    print("Statement Similarity Analysis:")
-    print("-" * 50)
+    non_tech_statements = [
+        "enjoys outdoor activities",
+        "loves cooking",
+        "interested in sports",
+        "enjoys reading fiction"
+    ]
     
-    for stmt1, stmt2 in statement_pairs:
-        similarity = evaluator.test_statement_similarity(stmt1, stmt2)
-        print(f"'{stmt1}' <-> '{stmt2}': {similarity:.4f}")
-
-
-def create_comprehensive_report(trainer: UniversalUserEmbeddingTrainer, 
-                              evaluator: UniversalUserEmbeddingEvaluator):
-    """Create a comprehensive demo report."""
-    print("\n" + "=" * 60)
-    print("CREATING COMPREHENSIVE DEMO REPORT")
-    print("=" * 60)
+    print("\nTech statement similarities:")
+    for i, stmt1 in enumerate(tech_statements):
+        for j, stmt2 in enumerate(tech_statements[i+1:], i+1):
+            sim = evaluator.test_statement_similarity(stmt1, stmt2)
+            print(f"  '{stmt1}' vs '{stmt2}': {sim:.4f}")
     
-    # Get test data
-    test_users, candidate_statements = create_evaluation_data(trainer.config)
+    print("\nNon-tech statement similarities:")
+    for i, stmt1 in enumerate(non_tech_statements):
+        for j, stmt2 in enumerate(non_tech_statements[i+1:], i+1):
+            sim = evaluator.test_statement_similarity(stmt1, stmt2)
+            print(f"  '{stmt1}' vs '{stmt2}': {sim:.4f}")
     
-    # Create evaluation report
-    report_path = "./demo_outputs/comprehensive_report.json"
-    report = create_evaluation_report(
-        evaluator, test_users, candidate_statements, report_path
-    )
+    print("\nCross-category similarities:")
+    for tech_stmt in tech_statements[:2]:
+        for non_tech_stmt in non_tech_statements[:2]:
+            sim = evaluator.test_statement_similarity(tech_stmt, non_tech_stmt)
+            print(f"  '{tech_stmt}' vs '{non_tech_stmt}': {sim:.4f}")
     
-    # Add demo-specific information
-    demo_info = {
-        "demo_configuration": {
-            "base_model": trainer.config.base_model_name,
-            "embedding_dim": trainer.config.embedding_dim,
-            "training_epochs": trainer.config.num_epochs,
-            "batch_size": trainer.config.batch_size,
-            "learning_rate": trainer.config.learning_rate
+    # Step 6: User embedding analysis
+    print("\n" + "="*40)
+    print("STEP 6: USER EMBEDDING ANALYSIS")
+    print("="*40)
+    
+    # Get embeddings for different types of users
+    tech_user_chunks = [
+        "I love programming and working on AI projects",
+        "Reading research papers about machine learning",
+        "Building neural networks and experimenting with new algorithms"
+    ]
+    
+    cooking_user_chunks = [
+        "I love cooking and trying new recipes",
+        "Experimenting with different cuisines",
+        "Reading cookbooks and food blogs"
+    ]
+    
+    sports_user_chunks = [
+        "I love playing basketball and watching sports",
+        "Going to the gym regularly",
+        "Following professional sports teams"
+    ]
+    
+    # Get embeddings
+    tech_embedding = evaluator.get_user_embedding(tech_user_chunks)
+    cooking_embedding = evaluator.get_user_embedding(cooking_user_chunks)
+    sports_embedding = evaluator.get_user_embedding(sports_user_chunks)
+    
+    # Compute similarities between users
+    tech_cooking_sim = np.dot(tech_embedding, cooking_embedding)
+    tech_sports_sim = np.dot(tech_embedding, sports_embedding)
+    cooking_sports_sim = np.dot(cooking_embedding, sports_embedding)
+    
+    print(f"\nUser similarity analysis:")
+    print(f"  Tech user vs Cooking user: {tech_cooking_sim:.4f}")
+    print(f"  Tech user vs Sports user: {tech_sports_sim:.4f}")
+    print(f"  Cooking user vs Sports user: {cooking_sports_sim:.4f}")
+    
+    # Step 7: Generate final report
+    print("\n" + "="*40)
+    print("STEP 7: FINAL DEMO REPORT")
+    print("="*40)
+    
+    # Save demo results
+    demo_results = {
+        "model_config": {
+            "user_model": config.user_model_name,
+            "item_model": config.item_model_name,
+            "embedding_dim": config.embedding_dim,
+            "temperature": config.temperature
         },
-        "training_summary": {
-            "num_train_users": len(trainer.train_data),
-            "num_eval_users": len(trainer.eval_data),
-            "statement_pool_size": len(trainer.statement_pool),
+        "training": {
+            "num_train_users": len(train_data),
+            "num_eval_users": len(eval_data),
+            "statement_pool_size": len(statement_pool),
             "best_eval_accuracy": trainer.best_eval_acc
+        },
+        "evaluation": report,
+        "inference_demo": {
+            "test_user": test_user_chunks[0],
+            "top_similar_statements": similarities[:3]
+        },
+        "user_similarities": {
+            "tech_cooking": float(tech_cooking_sim),
+            "tech_sports": float(tech_sports_sim),
+            "cooking_sports": float(cooking_sports_sim)
         }
     }
     
-    report["demo_info"] = demo_info
+    # Save results
+    import json
+    output_path = Path("./demo_outputs/demo_results.json")
+    output_path.parent.mkdir(exist_ok=True)
     
-    # Save updated report
-    with open(report_path, 'w') as f:
-        json.dump(report, f, indent=2)
+    with open(output_path, 'w') as f:
+        json.dump(demo_results, f, indent=2)
     
-    print(f"Comprehensive report saved to {report_path}")
+    print(f"\nDemo results saved to: {output_path}")
     
-    return report
+    # Print summary
+    print("\n" + "="*60)
+    print("DEMO SUMMARY")
+    print("="*60)
+    print(f"✅ Two-tower model trained successfully")
+    print(f"✅ Model evaluation completed")
+    print(f"✅ Inference capabilities demonstrated")
+    print(f"✅ Similarity analysis performed")
+    print(f"✅ User embedding analysis completed")
+    print(f"✅ Results saved to ./demo_outputs/")
+    
+    print(f"\nKey Results:")
+    print(f"  Best Evaluation Accuracy: {trainer.best_eval_acc:.4f}")
+    print(f"  Preference Retrieval F1@10: {report['preference_retrieval']['f1@k']:.4f}")
+    print(f"  Zero-shot Inference F1: {report['zero_shot_inference']['f1']:.4f}")
+    print(f"  Zero-shot Inference AUC: {report['zero_shot_inference']['auc']:.4f}")
+    
+    print(f"\nThe two-tower model successfully learned to:")
+    print(f"  • Encode users and items into a shared embedding space")
+    print(f"  • Distinguish between related and unrelated statements")
+    print(f"  • Capture semantic similarities between different user types")
+    print(f"  • Perform zero-shot preference inference")
+    
+    return demo_results
 
 
 def main():
-    """Main demo function."""
-    print("Universal User Embeddings - Complete Demo")
-    print("This demo will:")
-    print("1. Train a Universal User Embeddings model")
-    print("2. Evaluate the model performance")
-    print("3. Demonstrate inference capabilities")
-    print("4. Show statement similarity analysis")
-    print("5. Generate a comprehensive report")
-    
-    # Check if CUDA is available
-    if torch.cuda.is_available():
-        print(f"\nCUDA available: {torch.cuda.get_device_name(0)}")
-    else:
-        print("\nUsing CPU for training")
-    
+    """Main function to run the demo."""
     try:
-        # Step 1: Training
-        trainer = run_training_demo()
-        
-        # Step 2: Evaluation
-        evaluator = run_evaluation_demo(trainer)
-        
-        # Step 3: Inference Demo
-        run_inference_demo(evaluator)
-        
-        # Step 4: Statement Similarity Demo
-        run_statement_similarity_demo(evaluator)
-        
-        # Step 5: Comprehensive Report
-        report = create_comprehensive_report(trainer, evaluator)
-        
-        print("\n" + "=" * 60)
-        print("DEMO COMPLETED SUCCESSFULLY!")
-        print("=" * 60)
-        print("Check the ./demo_outputs/ directory for:")
-        print("- Trained model checkpoints")
-        print("- Evaluation reports")
-        print("- Training logs")
-        
+        results = run_two_tower_demo()
+        print(f"\n🎉 Demo completed successfully!")
+        return results
     except Exception as e:
-        print(f"\nDemo failed with error: {e}")
+        print(f"\n❌ Demo failed with error: {e}")
         import traceback
         traceback.print_exc()
+        return None
 
 
 if __name__ == "__main__":

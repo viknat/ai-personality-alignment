@@ -27,14 +27,14 @@ from ..schemas.universal_schema import ModelConfig, UserData, BatchData
 
 class UniversalUserEmbeddingTrainer:
     """
-    Trainer for Universal User Embeddings model.
+    Trainer for Universal User Embeddings model with proper two-tower architecture.
     
     This class handles:
-    - Model training with contrastive learning
+    - Model training with contrastive learning using separate optimizers
     - Evaluation and metrics tracking
     - Model checkpointing and saving
     - Logging with wandb
-    - Learning rate scheduling
+    - Learning rate scheduling for each tower
     """
     
     def __init__(self, 
@@ -44,7 +44,8 @@ class UniversalUserEmbeddingTrainer:
                  eval_data: Optional[List[UserData]] = None,
                  statement_pool: Optional[List[str]] = None,
                  output_dir: str = "./outputs",
-                 use_wandb: bool = True):
+                 use_wandb: bool = True,
+                 use_mixed_precision: bool = True):
         """
         Initialize the trainer.
         
@@ -56,11 +57,13 @@ class UniversalUserEmbeddingTrainer:
             statement_pool: Pool of statements for negative sampling
             output_dir: Directory to save outputs
             use_wandb: Whether to use wandb for logging
+            use_mixed_precision: Whether to use mixed precision training
         """
         self.config = config
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.use_wandb = use_wandb
+        self.use_mixed_precision = use_mixed_precision
         
         # Setup device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -76,22 +79,40 @@ class UniversalUserEmbeddingTrainer:
         # Initialize loss function
         self.loss_fn = ContrastiveLoss(
             temperature=config.temperature,
-            learnable_temperature=True
+            learnable_temperature=True  # Enable learnable temperature
         ).to(self.device)
         
-        # Initialize optimizer
-        self.optimizer = optim.AdamW(
-            self.model.parameters(),
+        # Initialize separate optimizers for each tower
+        self.user_optimizer = optim.AdamW(
+            self.model.user_tower.parameters(),
             lr=config.learning_rate,
             weight_decay=config.weight_decay
         )
         
-        # Initialize scheduler
-        self.scheduler = CosineAnnealingLR(
-            self.optimizer,
+        self.item_optimizer = optim.AdamW(
+            self.model.item_tower.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay
+        )
+        
+        # Initialize separate schedulers
+        self.user_scheduler = CosineAnnealingLR(
+            self.user_optimizer,
             T_max=config.num_epochs,
             eta_min=config.learning_rate * 0.01
         )
+        
+        self.item_scheduler = CosineAnnealingLR(
+            self.item_optimizer,
+            T_max=config.num_epochs,
+            eta_min=config.learning_rate * 0.01
+        )
+        
+        # Setup mixed precision training
+        if self.use_mixed_precision:
+            self.scaler = torch.cuda.amp.GradScaler()
+        else:
+            self.scaler = None
         
         # Setup data
         if train_data is None or statement_pool is None:
@@ -135,21 +156,21 @@ class UniversalUserEmbeddingTrainer:
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
             handlers=[
-                logging.FileHandler(self.output_dir / "training.log"),
+                logging.FileHandler(self.output_dir / "two_tower_training.log"),
                 logging.StreamHandler()
             ]
         )
         
         if self.use_wandb:
             wandb.init(
-                project="universal-user-embeddings",
+                project="two-tower-user-embeddings",
                 config=vars(self.config),
-                name=f"uue_{self.config.base_model_name.split('/')[-1]}"
+                name=f"two_tower_{self.config.user_model_name.split('/')[-1]}_{self.config.item_model_name.split('/')[-1]}"
             )
     
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """
-        Train for one epoch.
+        Train for one epoch with proper two-tower optimization.
         
         Args:
             epoch: Current epoch number
@@ -169,30 +190,82 @@ class UniversalUserEmbeddingTrainer:
         )
         
         for batch_idx, batch_data in enumerate(progress_bar):
-            # Forward pass
-            outputs = self.model(
-                user_chunks=batch_data.user_texts,
-                positive_statements=batch_data.positive_statements,
-                negative_statements=batch_data.negative_statements
-            )
+            # Forward pass with mixed precision
+            if self.use_mixed_precision:
+                with torch.cuda.amp.autocast():
+                    outputs = self.model(
+                        user_chunks=batch_data.user_texts,
+                        positive_statements=batch_data.positive_statements,
+                        negative_statements=batch_data.negative_statements
+                    )
+                    
+                    # Compute loss
+                    loss_result = self.loss_fn(
+                        user_embeddings=outputs["user_embeddings"],
+                        positive_embeddings=outputs["positive_embeddings"],
+                        negative_embeddings=outputs.get("negative_embeddings")
+                    )
+                    
+                    loss = loss_result["loss"]
+            else:
+                outputs = self.model(
+                    user_chunks=batch_data.user_texts,
+                    positive_statements=batch_data.positive_statements,
+                    negative_statements=batch_data.negative_statements
+                )
+                
+                # Compute loss
+                loss_result = self.loss_fn(
+                    user_embeddings=outputs["user_embeddings"],
+                    positive_embeddings=outputs["positive_embeddings"],
+                    negative_embeddings=outputs.get("negative_embeddings")
+                )
+                
+                loss = loss_result["loss"]
             
-            # Compute loss
-            loss_result = self.loss_fn(
-                user_embeddings=outputs["user_embeddings"],
-                positive_embeddings=outputs["positive_embeddings"],
-                negative_embeddings=outputs.get("negative_embeddings")
-            )
+            # Backward pass with separate optimizers
+            if self.use_mixed_precision:
+                self.scaler.scale(loss).backward()
+                
+                # Gradient clipping for user tower
+                self.scaler.unscale_(self.user_optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.user_tower.parameters(), max_norm=1.0)
+                
+                # Gradient clipping for item tower
+                self.scaler.unscale_(self.item_optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.item_tower.parameters(), max_norm=1.0)
+                
+                # Gradient clipping for temperature parameter (prevent explosion)
+                if hasattr(self.model, 'log_temperature'):
+                    torch.nn.utils.clip_grad_norm_([self.model.log_temperature], max_norm=0.1)
+                if hasattr(self.loss_fn, 'log_temperature') and self.loss_fn.log_temperature is not None:
+                    torch.nn.utils.clip_grad_norm_([self.loss_fn.log_temperature], max_norm=0.1)
+                
+                # Step optimizers
+                self.scaler.step(self.user_optimizer)
+                self.scaler.step(self.item_optimizer)
+                self.scaler.update()
+            else:
+                # Regular backward pass
+                loss.backward()
+                
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(self.model.user_tower.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(self.model.item_tower.parameters(), max_norm=1.0)
+                
+                # Gradient clipping for temperature parameter (prevent explosion)
+                if hasattr(self.model, 'log_temperature'):
+                    torch.nn.utils.clip_grad_norm_([self.model.log_temperature], max_norm=0.1)
+                if hasattr(self.loss_fn, 'log_temperature') and self.loss_fn.log_temperature is not None:
+                    torch.nn.utils.clip_grad_norm_([self.loss_fn.log_temperature], max_norm=0.1)
+                
+                # Step optimizers
+                self.user_optimizer.step()
+                self.item_optimizer.step()
             
-            loss = loss_result["loss"]
-            
-            # Backward pass
-            self.optimizer.zero_grad()
-            loss.backward()
-            
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            
-            self.optimizer.step()
+            # Zero gradients
+            self.user_optimizer.zero_grad()
+            self.item_optimizer.zero_grad()
             
             # Update metrics
             total_loss += loss.item()
@@ -202,7 +275,8 @@ class UniversalUserEmbeddingTrainer:
             # Update progress bar
             progress_bar.set_postfix({
                 'loss': f"{loss.item():.4f}",
-                'acc': f"{loss_result['avg_acc'].item():.4f}"
+                'acc': f"{loss_result['avg_acc'].item():.4f}",
+                'temp': f"{outputs['temperature'].item():.3f}"
             })
             
             # Log to wandb
@@ -210,8 +284,9 @@ class UniversalUserEmbeddingTrainer:
                 wandb.log({
                     "train/loss": loss.item(),
                     "train/accuracy": loss_result["avg_acc"].item(),
-                    "train/temperature": loss_result["temperature"].item(),
-                    "train/learning_rate": self.optimizer.param_groups[0]["lr"],
+                    "train/temperature": outputs["temperature"].item(),
+                    "train/user_lr": self.user_optimizer.param_groups[0]["lr"],
+                    "train/item_lr": self.item_optimizer.param_groups[0]["lr"],
                     "train/step": self.global_step
                 })
             
@@ -225,14 +300,15 @@ class UniversalUserEmbeddingTrainer:
                 # Save best model
                 if eval_metrics["eval/accuracy"] > self.best_eval_acc:
                     self.best_eval_acc = eval_metrics["eval/accuracy"]
-                    self.save_model("best_model.pt")
+                    self.save_model("best_two_tower_model.pt")
             
             # Save checkpoint
             if self.global_step % self.config.save_steps == 0:
-                self.save_checkpoint(f"checkpoint_step_{self.global_step}.pt")
+                self.save_checkpoint(f"two_tower_checkpoint_step_{self.global_step}.pt")
         
-        # Update learning rate
-        self.scheduler.step()
+        # Update learning rate schedulers
+        self.user_scheduler.step()
+        self.item_scheduler.step()
         
         return {
             "train/loss": total_loss / num_batches,
@@ -241,7 +317,7 @@ class UniversalUserEmbeddingTrainer:
     
     def evaluate(self) -> Dict[str, float]:
         """
-        Evaluate the model on validation data.
+        Evaluate the two-tower model on validation data.
         
         Returns:
             Dictionary of evaluation metrics
@@ -278,13 +354,13 @@ class UniversalUserEmbeddingTrainer:
     
     def log_eval_metrics(self, metrics: Dict[str, float]):
         """Log evaluation metrics."""
-        logging.info(f"Evaluation metrics: {metrics}")
+        logging.info(f"Two-Tower Evaluation metrics: {metrics}")
         
         if self.use_wandb:
             wandb.log(metrics, step=self.global_step)
     
     def save_model(self, filename: str):
-        """Save the model."""
+        """Save the two-tower model."""
         model_path = self.output_dir / filename
         torch.save({
             "model_state_dict": self.model.state_dict(),
@@ -292,38 +368,44 @@ class UniversalUserEmbeddingTrainer:
             "global_step": self.global_step,
             "best_eval_acc": self.best_eval_acc
         }, model_path)
-        logging.info(f"Model saved to {model_path}")
+        logging.info(f"Two-Tower model saved to {model_path}")
     
     def save_checkpoint(self, filename: str):
-        """Save a training checkpoint."""
+        """Save a training checkpoint for two-tower model."""
         checkpoint_path = self.output_dir / filename
         torch.save({
             "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "scheduler_state_dict": self.scheduler.state_dict(),
+            "user_optimizer_state_dict": self.user_optimizer.state_dict(),
+            "item_optimizer_state_dict": self.item_optimizer.state_dict(),
+            "user_scheduler_state_dict": self.user_scheduler.state_dict(),
+            "item_scheduler_state_dict": self.item_scheduler.state_dict(),
             "config": self.config,
             "global_step": self.global_step,
             "best_eval_acc": self.best_eval_acc,
             "best_eval_loss": self.best_eval_loss
         }, checkpoint_path)
-        logging.info(f"Checkpoint saved to {checkpoint_path}")
+        logging.info(f"Two-Tower checkpoint saved to {checkpoint_path}")
     
     def load_checkpoint(self, checkpoint_path: str):
-        """Load a training checkpoint."""
+        """Load a training checkpoint for two-tower model."""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
         self.model.load_state_dict(checkpoint["model_state_dict"])
-        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        self.user_optimizer.load_state_dict(checkpoint["user_optimizer_state_dict"])
+        self.item_optimizer.load_state_dict(checkpoint["item_optimizer_state_dict"])
+        self.user_scheduler.load_state_dict(checkpoint["user_scheduler_state_dict"])
+        self.item_scheduler.load_state_dict(checkpoint["item_scheduler_state_dict"])
         self.global_step = checkpoint["global_step"]
         self.best_eval_acc = checkpoint["best_eval_acc"]
         self.best_eval_loss = checkpoint["best_eval_loss"]
         
-        logging.info(f"Checkpoint loaded from {checkpoint_path}")
+        logging.info(f"Two-Tower checkpoint loaded from {checkpoint_path}")
     
     def train(self):
-        """Main training loop."""
-        logging.info("Starting training...")
+        """Main training loop for two-tower model."""
+        logging.info("Starting Two-Tower training...")
+        logging.info(f"User Tower: {self.config.user_model_name}")
+        logging.info(f"Item Tower: {self.config.item_model_name}")
         logging.info(f"Training on {len(self.train_data)} users")
         logging.info(f"Evaluating on {len(self.eval_data)} users")
         
@@ -344,102 +426,104 @@ class UniversalUserEmbeddingTrainer:
             # Save best model
             if eval_metrics["eval/accuracy"] > self.best_eval_acc:
                 self.best_eval_acc = eval_metrics["eval/accuracy"]
-                self.save_model("best_model.pt")
+                self.save_model("best_two_tower_model.pt")
             
             # Save checkpoint
             if (epoch + 1) % 5 == 0:
-                self.save_checkpoint(f"checkpoint_epoch_{epoch + 1}.pt")
+                self.save_checkpoint(f"two_tower_epoch_{epoch + 1}.pt")
         
-        # Save final model
-        self.save_model("final_model.pt")
-        logging.info("Training completed!")
-        
-        if self.use_wandb:
-            wandb.finish()
+        logging.info("Two-Tower training completed!")
+        logging.info(f"Best evaluation accuracy: {self.best_eval_acc:.4f}")
     
-    def test_user_embedding(self, user_chunks: List[str]) -> torch.Tensor:
+    def test_user_embedding(self, user_chunks: List[str], user_metadata: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Test the model by getting an embedding for a user.
+        Test the two-tower model by getting a user embedding.
         
         Args:
             user_chunks: List of text chunks for the user
+            user_metadata: Optional user metadata
             
         Returns:
             User embedding vector
         """
         self.model.eval()
         with torch.no_grad():
-            embedding = self.model.get_user_embedding(user_chunks)
+            embedding = self.model.get_user_embedding(user_chunks, user_metadata)
         return embedding
     
-    def test_statement_embedding(self, statement: str, context: Optional[str] = None) -> torch.Tensor:
+    def test_statement_embedding(self, statement: str, item_metadata: Optional[torch.Tensor] = None, context: Optional[str] = None) -> torch.Tensor:
         """
-        Test the model by getting an embedding for a statement.
+        Test the two-tower model by getting an item embedding.
         
         Args:
-            statement: Behavioral statement
+            statement: Item description/statement
+            item_metadata: Optional item metadata
             context: Optional context string
             
         Returns:
-            Statement embedding vector
+            Item embedding vector
         """
         self.model.eval()
         with torch.no_grad():
-            embedding = self.model.get_statement_embedding(statement, context)
+            embedding = self.model.get_statement_embedding(statement, item_metadata, context)
         return embedding
     
-    def compute_similarity(self, user_chunks: List[str], statement: str, context: Optional[str] = None) -> float:
+    def compute_similarity(self, user_chunks: List[str], statement: str, 
+                          user_metadata: Optional[torch.Tensor] = None,
+                          item_metadata: Optional[torch.Tensor] = None,
+                          context: Optional[str] = None) -> float:
         """
-        Compute similarity between a user and a statement.
+        Compute similarity between a user and an item using the two-tower model.
         
         Args:
             user_chunks: List of text chunks for the user
-            statement: Behavioral statement
+            statement: Item description/statement
+            user_metadata: Optional user metadata
+            item_metadata: Optional item metadata
             context: Optional context string
             
         Returns:
             Similarity score (cosine similarity)
         """
-        user_embedding = self.test_user_embedding(user_chunks)
-        statement_embedding = self.test_statement_embedding(statement, context)
+        user_embedding = self.test_user_embedding(user_chunks, user_metadata)
+        statement_embedding = self.test_statement_embedding(statement, item_metadata, context)
         
         similarity = torch.sum(user_embedding * statement_embedding).item()
         return similarity
 
 
 def main():
-    """Main function for training."""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Train Universal User Embeddings")
-    parser.add_argument("--config", type=str, help="Path to config file")
-    parser.add_argument("--output_dir", type=str, default="./outputs", help="Output directory")
-    parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
-    parser.add_argument("--resume", type=str, help="Resume from checkpoint")
-    
-    args = parser.parse_args()
-    
-    # Load config
-    if args.config:
-        with open(args.config, 'r') as f:
-            config_dict = json.load(f)
-        config = ModelConfig(**config_dict)
-    else:
-        config = ModelConfig()  # Use default config
-    
-    # Create trainer
-    trainer = UniversalUserEmbeddingTrainer(
-        config=config,
-        output_dir=args.output_dir,
-        use_wandb=not args.no_wandb
+    """Main function to run two-tower training."""
+    # Create configuration for proper two-tower model
+    config = ModelConfig(
+        user_model_name="Qwen/Qwen3-Embedding-0.6B",
+        item_model_name="Qwen/Qwen3-Embedding-0.6B",
+        embedding_dim=1024,
+        batch_size=32,
+        learning_rate=2e-5,
+        temperature=0.1,
+        num_epochs=10,
+        use_user_metadata=True,
+        use_item_metadata=True
     )
     
-    # Resume from checkpoint if specified
-    if args.resume:
-        trainer.load_checkpoint(args.resume)
+    # Initialize trainer
+    trainer = UniversalUserEmbeddingTrainer(
+        config=config,
+        output_dir="./two_tower_outputs",
+        use_wandb=True,
+        use_mixed_precision=True
+    )
     
-    # Start training
+    # Train the model
     trainer.train()
+    
+    # Test the model
+    test_user_chunks = ["I love programming", "Working on AI projects"]
+    test_item = "interested in technology"
+    
+    similarity = trainer.compute_similarity(test_user_chunks, test_item)
+    print(f"Similarity between user and item: {similarity:.4f}")
 
 
 if __name__ == "__main__":

@@ -34,9 +34,16 @@ class ContrastiveLoss(nn.Module):
         self.learnable_temperature = learnable_temperature
         
         if learnable_temperature:
+            # Use log-temperature with bounds to prevent gradient explosion
+            # τ = exp(log_τ) where log_τ is constrained to [log(0.01), log(10.0)]
             self.log_temperature = nn.Parameter(torch.log(torch.tensor(temperature)))
+            # Register bounds for gradient clipping
+            self.register_buffer('log_temp_min', torch.log(torch.tensor(0.01)))
+            self.register_buffer('log_temp_max', torch.log(torch.tensor(10.0)))
         else:
             self.log_temperature = None
+            self.log_temp_min = None
+            self.log_temp_max = None
     
     def forward(self, 
                 user_embeddings: torch.Tensor,
@@ -55,9 +62,11 @@ class ContrastiveLoss(nn.Module):
         """
         batch_size = user_embeddings.size(0)
         
-        # Get temperature
+        # Get temperature with bounds
         if self.learnable_temperature:
-            temperature = torch.exp(self.log_temperature)
+            # Apply bounds to prevent gradient explosion
+            log_temp = torch.clamp(self.log_temperature, self.log_temp_min, self.log_temp_max)
+            temperature = torch.exp(log_temp)
         else:
             temperature = self.temperature
         
@@ -114,7 +123,7 @@ class ContrastiveLoss(nn.Module):
                               negative_embeddings: torch.Tensor,
                               temperature: float) -> torch.Tensor:
         """
-        Compute additional loss using negative samples.
+        Compute additional loss using negative samples with symmetric components.
         
         Args:
             user_embeddings: (batch_size, embedding_dim)
@@ -135,23 +144,33 @@ class ContrastiveLoss(nn.Module):
         ).squeeze(1) / temperature
         
         # Compute similarities between positive statements and negative statements
-        # (batch_size, num_negatives)
-        pos_neg_sims = torch.bmm(
+        # (batch_size, num_negatives) - SYMMETRIC COMPONENT
+        statement_neg_sims = torch.bmm(
             positive_embeddings.unsqueeze(1),
             negative_embeddings.transpose(1, 2)
         ).squeeze(1) / temperature
         
-        # Create logits: [positive_sim, negative_sim_1, negative_sim_2, ...]
-        logits = torch.cat([
+        # Create logits for user-to-negative direction: [positive_sim, negative_sim_1, negative_sim_2, ...]
+        user_logits = torch.cat([
             torch.sum(user_embeddings * positive_embeddings, dim=1, keepdim=True) / temperature,
             user_neg_sims
+        ], dim=1)
+        
+        # Create logits for statement-to-negative direction: [positive_sim, negative_sim_1, negative_sim_2, ...]
+        statement_logits = torch.cat([
+            torch.sum(user_embeddings * positive_embeddings, dim=1, keepdim=True) / temperature,
+            statement_neg_sims
         ], dim=1)
         
         # Labels are 0 (positive pair should have highest similarity)
         labels = torch.zeros(batch_size, device=user_embeddings.device, dtype=torch.long)
         
-        # Compute cross-entropy loss
-        neg_loss = F.cross_entropy(logits, labels)
+        # Compute cross-entropy loss for both directions
+        user_neg_loss = F.cross_entropy(user_logits, labels)
+        statement_neg_loss = F.cross_entropy(statement_logits, labels)
+        
+        # Symmetric negative loss
+        neg_loss = (user_neg_loss + statement_neg_loss) / 2
         
         return neg_loss
 

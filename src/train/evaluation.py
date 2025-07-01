@@ -1,64 +1,57 @@
 """
-Evaluation Module for Universal User Embeddings.
+Evaluation module for Universal User Embeddings with two-tower architecture.
 
-This module provides comprehensive evaluation capabilities for the trained model,
-including preference retrieval, zero-shot inference, and personality trait analysis.
+This module provides comprehensive evaluation capabilities for the two-tower model:
+- Preference statement retrieval evaluation
+- Zero-shot preference inference
+- Statement similarity analysis
+- User embedding analysis
 """
 
 import torch
 import numpy as np
-from typing import List, Dict, Any, Optional, Tuple
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
-import json
-from pathlib import Path
+from typing import List, Dict, Optional, Tuple
+from sklearn.metrics import precision_recall_fscore_support, roc_auc_score, average_precision_score
+from sklearn.metrics.pairwise import cosine_similarity
+import logging
 
 from .model import UniversalUserEmbeddingModel
-from .trainer import UniversalUserEmbeddingTrainer
-from ..schemas.universal_schema import ModelConfig, UserData
+from ..schemas.universal_schema import UserData, ModelConfig
 
 
 class UniversalUserEmbeddingEvaluator:
     """
-    Evaluator for Universal User Embeddings model.
+    Evaluator for Universal User Embeddings with two-tower architecture.
     
-    This class provides comprehensive evaluation capabilities:
-    - Preference statement retrieval
-    - Zero-shot preference inference
-    - Personality trait regression
-    - User similarity analysis
+    This class provides comprehensive evaluation capabilities for the two-tower model,
+    including preference retrieval, zero-shot inference, and similarity analysis.
     """
     
-    def __init__(self, 
-                 model_path: str,
-                 config: Optional[ModelConfig] = None,
-                 device: Optional[str] = None):
+    def __init__(self, model_path: str, config: Optional[ModelConfig] = None):
         """
         Initialize the evaluator.
         
         Args:
             model_path: Path to the trained model checkpoint
-            config: Model configuration (optional, loaded from checkpoint if not provided)
-            device: Device to run evaluation on
+            config: Model configuration (optional, will be loaded from checkpoint)
         """
         # Load model checkpoint
         checkpoint = torch.load(model_path, map_location='cpu')
         
         if config is None:
-            config = checkpoint["config"]
+            config = checkpoint['config']
         
         self.config = config
-        self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
-        
-        # Initialize model
         self.model = UniversalUserEmbeddingModel(config)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # Move to device
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
         self.model.eval()
         
-        print(f"Model loaded from {model_path}")
-        print(f"Using device: {self.device}")
+        logging.info(f"Model loaded from {model_path}")
+        logging.info(f"Using device: {self.device}")
     
     def evaluate_preference_retrieval(self, 
                                     test_users: List[UserData],
@@ -68,9 +61,9 @@ class UniversalUserEmbeddingEvaluator:
         Evaluate preference statement retrieval performance.
         
         Args:
-            test_users: List of test users with known preferences
-            candidate_statements: Pool of candidate statements to retrieve from
-            top_k: Number of top statements to retrieve
+            test_users: List of test users
+            candidate_statements: List of candidate statements to rank
+            top_k: Number of top statements to consider
             
         Returns:
             Dictionary of retrieval metrics
@@ -174,97 +167,53 @@ class UniversalUserEmbeddingEvaluator:
                 best_f1 = f1
                 best_threshold = threshold
         
-        # Compute final metrics with best threshold
+        # Compute final metrics with optimal threshold
         final_predictions = (similarities > best_threshold).astype(int)
         precision, recall, f1, _ = precision_recall_fscore_support(
             labels, final_predictions, average='binary', zero_division=0
         )
         
+        # Compute AUC and AP
+        try:
+            auc = roc_auc_score(labels, similarities)
+        except ValueError:
+            auc = 0.5  # Default if only one class
+        
+        try:
+            ap = average_precision_score(labels, similarities)
+        except ValueError:
+            ap = 0.0  # Default if only one class
+        
         return {
             "precision": precision,
             "recall": recall,
-            "f1_score": f1,
-            "best_threshold": best_threshold,
-            "auc": np.trapz(recall, precision) if len(np.unique(labels)) > 1 else 0.5
+            "f1": f1,
+            "auc": auc,
+            "average_precision": ap,
+            "optimal_threshold": best_threshold,
+            "num_samples": len(similarities)
         }
     
-    def evaluate_personality_traits(self,
-                                  users_with_traits: List[Tuple[UserData, Dict[str, float]]],
-                                  trait_names: List[str]) -> Dict[str, Dict[str, float]]:
+    def evaluate_user_similarity(self, 
+                               test_users: List[UserData],
+                               similarity_threshold: float = 0.5) -> Dict[str, float]:
         """
-        Evaluate personality trait regression performance.
+        Evaluate user similarity computation.
         
         Args:
-            users_with_traits: List of (user, traits_dict) tuples
-            trait_names: List of trait names to evaluate
+            test_users: List of test users
+            similarity_threshold: Threshold for considering users similar
             
         Returns:
-            Dictionary of regression metrics for each trait
+            Dictionary of user similarity metrics
         """
-        print("Evaluating personality trait regression...")
+        print("Evaluating user similarity computation...")
         
-        results = {}
-        
-        for trait in trait_names:
-            # Extract embeddings and trait values
-            embeddings = []
-            trait_values = []
-            
-            for user, traits in users_with_traits:
-                if trait in traits:
-                    user_chunks = [chunk.text for chunk in user.chunks]
-                    user_embedding = self.model.get_user_embedding(user_chunks)
-                    embeddings.append(user_embedding.cpu().numpy())
-                    trait_values.append(traits[trait])
-            
-            if len(embeddings) < 10:  # Need sufficient data
-                print(f"Warning: Insufficient data for trait {trait}")
-                continue
-            
-            embeddings = np.array(embeddings)
-            trait_values = np.array(trait_values)
-            
-            # Split data
-            X_train, X_test, y_train, y_test = train_test_split(
-                embeddings, trait_values, test_size=0.3, random_state=42
-            )
-            
-            # Train regression model
-            regressor = LogisticRegression(random_state=42, max_iter=1000)
-            regressor.fit(X_train, y_train)
-            
-            # Evaluate
-            y_pred = regressor.predict(X_test)
-            accuracy = accuracy_score(y_test, y_pred)
-            
-            # Compute correlation
-            correlation = np.corrcoef(y_test, y_pred)[0, 1] if len(y_test) > 1 else 0
-            
-            results[trait] = {
-                "accuracy": accuracy,
-                "correlation": correlation,
-                "n_samples": len(embeddings)
-            }
-        
-        return results
-    
-    def analyze_user_similarities(self, users: List[UserData]) -> Dict[str, Any]:
-        """
-        Analyze user similarities in the embedding space.
-        
-        Args:
-            users: List of users to analyze
-            
-        Returns:
-            Dictionary containing similarity analysis
-        """
-        print("Analyzing user similarities...")
-        
-        # Get user embeddings
+        # Get all user embeddings
         user_embeddings = []
         user_ids = []
         
-        for user in users:
+        for user in test_users:
             user_chunks = [chunk.text for chunk in user.chunks]
             embedding = self.model.get_user_embedding(user_chunks)
             user_embeddings.append(embedding.cpu().numpy())
@@ -273,30 +222,23 @@ class UniversalUserEmbeddingEvaluator:
         user_embeddings = np.array(user_embeddings)
         
         # Compute pairwise similarities
-        similarity_matrix = np.matmul(user_embeddings, user_embeddings.T)
+        similarity_matrix = cosine_similarity(user_embeddings)
         
-        # Find most similar pairs
-        n_users = len(users)
-        most_similar_pairs = []
+        # Analyze similarity distribution
+        similarities = []
+        for i in range(len(similarity_matrix)):
+            for j in range(i + 1, len(similarity_matrix)):
+                similarities.append(similarity_matrix[i, j])
         
-        for i in range(n_users):
-            for j in range(i + 1, n_users):
-                similarity = similarity_matrix[i, j]
-                most_similar_pairs.append((user_ids[i], user_ids[j], similarity))
-        
-        # Sort by similarity
-        most_similar_pairs.sort(key=lambda x: x[2], reverse=True)
-        
-        # Compute clustering statistics
-        mean_similarity = np.mean(similarity_matrix[np.triu_indices(n_users, k=1)])
-        std_similarity = np.std(similarity_matrix[np.triu_indices(n_users, k=1)])
+        similarities = np.array(similarities)
         
         return {
-            "similarity_matrix": similarity_matrix.tolist(),
-            "most_similar_pairs": most_similar_pairs[:10],  # Top 10
-            "mean_similarity": mean_similarity,
-            "std_similarity": std_similarity,
-            "user_ids": user_ids
+            "mean_similarity": np.mean(similarities),
+            "std_similarity": np.std(similarities),
+            "min_similarity": np.min(similarities),
+            "max_similarity": np.max(similarities),
+            "similarity_above_threshold": np.mean(similarities > similarity_threshold),
+            "num_user_pairs": len(similarities)
         }
     
     def test_statement_similarity(self, 
@@ -316,133 +258,172 @@ class UniversalUserEmbeddingEvaluator:
         Returns:
             Similarity score
         """
-        embedding1 = self.model.get_statement_embedding(statement1, context1)
-        embedding2 = self.model.get_statement_embedding(statement2, context2)
+        embedding1 = self.model.get_statement_embedding(statement1, context=context1)
+        embedding2 = self.model.get_statement_embedding(statement2, context=context2)
         
         similarity = torch.sum(embedding1 * embedding2).item()
         return similarity
     
-    def get_user_embedding(self, user_chunks: List[str]) -> np.ndarray:
+    def get_user_embedding(self, user_chunks: List[str], user_metadata: Optional[torch.Tensor] = None) -> np.ndarray:
         """
         Get embedding for a user.
         
         Args:
             user_chunks: List of text chunks for the user
+            user_metadata: Optional user metadata
             
         Returns:
             User embedding as numpy array
         """
-        embedding = self.model.get_user_embedding(user_chunks)
+        embedding = self.model.get_user_embedding(user_chunks, user_metadata)
         return embedding.cpu().numpy()
     
-    def get_statement_embedding(self, statement: str, context: Optional[str] = None) -> np.ndarray:
+    def get_statement_embedding(self, statement: str, item_metadata: Optional[torch.Tensor] = None, context: Optional[str] = None) -> np.ndarray:
         """
         Get embedding for a statement.
         
         Args:
             statement: Behavioral statement
+            item_metadata: Optional item metadata
             context: Optional context string
             
         Returns:
             Statement embedding as numpy array
         """
-        embedding = self.model.get_statement_embedding(statement, context)
+        embedding = self.model.get_statement_embedding(statement, item_metadata, context)
         return embedding.cpu().numpy()
-
-
-def create_evaluation_report(evaluator: UniversalUserEmbeddingEvaluator,
-                           test_users: List[UserData],
-                           candidate_statements: List[str],
-                           output_path: str = "evaluation_report.json"):
-    """
-    Create a comprehensive evaluation report.
     
-    Args:
-        evaluator: Initialized evaluator
-        test_users: Test users for evaluation
-        candidate_statements: Candidate statements for retrieval
-        output_path: Path to save the report
-    """
-    print("Creating comprehensive evaluation report...")
+    def compute_similarity(self, user_chunks: List[str], statement: str,
+                          user_metadata: Optional[torch.Tensor] = None,
+                          item_metadata: Optional[torch.Tensor] = None,
+                          context: Optional[str] = None) -> float:
+        """
+        Compute similarity between a user and a statement.
+        
+        Args:
+            user_chunks: List of text chunks for the user
+            statement: Behavioral statement
+            user_metadata: Optional user metadata
+            item_metadata: Optional item metadata
+            context: Optional context string
+            
+        Returns:
+            Similarity score (cosine similarity)
+        """
+        user_embedding = self.model.get_user_embedding(user_chunks, user_metadata)
+        statement_embedding = self.model.get_statement_embedding(statement, item_metadata, context)
+        
+        similarity = torch.sum(user_embedding * statement_embedding).item()
+        return similarity
     
-    report = {
-        "model_info": {
-            "base_model": evaluator.config.base_model_name,
-            "embedding_dim": evaluator.config.embedding_dim,
-            "temperature": evaluator.config.temperature
-        },
-        "evaluation_results": {}
-    }
+    def analyze_embedding_space(self, test_users: List[UserData], test_statements: List[str]) -> Dict[str, float]:
+        """
+        Analyze the embedding space properties.
+        
+        Args:
+            test_users: List of test users
+            test_statements: List of test statements
+            
+        Returns:
+            Dictionary of embedding space analysis metrics
+        """
+        print("Analyzing embedding space...")
+        
+        # Get user embeddings
+        user_embeddings = []
+        for user in test_users:
+            user_chunks = [chunk.text for chunk in user.chunks]
+            embedding = self.model.get_user_embedding(user_chunks)
+            user_embeddings.append(embedding.cpu().numpy())
+        
+        # Get statement embeddings
+        statement_embeddings = []
+        for statement in test_statements:
+            embedding = self.model.get_statement_embedding(statement)
+            statement_embeddings.append(embedding.cpu().numpy())
+        
+        user_embeddings = np.array(user_embeddings)
+        statement_embeddings = np.array(statement_embeddings)
+        
+        # Compute statistics
+        all_embeddings = np.vstack([user_embeddings, statement_embeddings])
+        
+        # Check normalization
+        user_norms = np.linalg.norm(user_embeddings, axis=1)
+        statement_norms = np.linalg.norm(statement_embeddings, axis=1)
+        
+        # Compute embedding space statistics
+        embedding_mean = np.mean(all_embeddings, axis=0)
+        embedding_std = np.std(all_embeddings, axis=0)
+        
+        return {
+            "user_embedding_mean_norm": np.mean(user_norms),
+            "user_embedding_std_norm": np.std(user_norms),
+            "statement_embedding_mean_norm": np.mean(statement_norms),
+            "statement_embedding_std_norm": np.std(statement_norms),
+            "embedding_space_mean": np.mean(embedding_mean),
+            "embedding_space_std": np.mean(embedding_std),
+            "num_user_embeddings": len(user_embeddings),
+            "num_statement_embeddings": len(statement_embeddings)
+        }
     
-    # Preference retrieval evaluation
-    retrieval_metrics = evaluator.evaluate_preference_retrieval(
-        test_users, candidate_statements, top_k=10
-    )
-    report["evaluation_results"]["preference_retrieval"] = retrieval_metrics
-    
-    # Zero-shot inference evaluation
-    zero_shot_metrics = evaluator.evaluate_zero_shot_inference(
-        test_users, candidate_statements
-    )
-    report["evaluation_results"]["zero_shot_inference"] = zero_shot_metrics
-    
-    # User similarity analysis
-    similarity_analysis = evaluator.analyze_user_similarities(test_users)
-    report["evaluation_results"]["user_similarities"] = similarity_analysis
-    
-    # Save report
-    with open(output_path, 'w') as f:
-        json.dump(report, f, indent=2)
-    
-    print(f"Evaluation report saved to {output_path}")
-    
-    # Print summary
-    print("\n=== EVALUATION SUMMARY ===")
-    print(f"Preference Retrieval F1@10: {retrieval_metrics['f1@k']:.4f}")
-    print(f"Zero-shot Inference F1: {zero_shot_metrics['f1_score']:.4f}")
-    print(f"Mean User Similarity: {similarity_analysis['mean_similarity']:.4f}")
-    
-    return report
-
-
-def main():
-    """Main function for evaluation."""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Evaluate Universal User Embeddings")
-    parser.add_argument("--model_path", type=str, required=True, help="Path to trained model")
-    parser.add_argument("--test_data", type=str, help="Path to test data JSON")
-    parser.add_argument("--output_dir", type=str, default="./evaluation", help="Output directory")
-    
-    args = parser.parse_args()
-    
-    # Create output directory
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Initialize evaluator
-    evaluator = UniversalUserEmbeddingEvaluator(args.model_path)
-    
-    # Load test data if provided
-    if args.test_data:
-        with open(args.test_data, 'r') as f:
-            test_data = json.load(f)
-        # Convert to UserData objects
-        test_users = []
-        for user_data in test_data["users"]:
-            # Implementation depends on your data format
-            pass
-    else:
-        # Use sample data for demonstration
-        from .data_loader import create_evaluation_data
-        test_users, candidate_statements = create_evaluation_data(evaluator.config)
-    
-    # Create evaluation report
-    report = create_evaluation_report(
-        evaluator, test_users, candidate_statements,
-        output_path=output_dir / "evaluation_report.json"
-    )
-
-
-if __name__ == "__main__":
-    main() 
+    def generate_evaluation_report(self, 
+                                 test_users: List[UserData],
+                                 candidate_statements: List[str],
+                                 test_statements: List[str]) -> Dict[str, Dict[str, float]]:
+        """
+        Generate a comprehensive evaluation report.
+        
+        Args:
+            test_users: List of test users
+            candidate_statements: List of candidate statements for retrieval
+            test_statements: List of statements for zero-shot inference
+            
+        Returns:
+            Comprehensive evaluation report
+        """
+        print("Generating comprehensive evaluation report...")
+        
+        report = {}
+        
+        # Preference retrieval evaluation
+        report["preference_retrieval"] = self.evaluate_preference_retrieval(
+            test_users, candidate_statements
+        )
+        
+        # Zero-shot inference evaluation
+        report["zero_shot_inference"] = self.evaluate_zero_shot_inference(
+            test_users, test_statements
+        )
+        
+        # User similarity evaluation
+        report["user_similarity"] = self.evaluate_user_similarity(test_users)
+        
+        # Embedding space analysis
+        report["embedding_space"] = self.analyze_embedding_space(test_users, test_statements)
+        
+        # Print summary
+        print("\n" + "="*50)
+        print("EVALUATION REPORT SUMMARY")
+        print("="*50)
+        
+        print(f"\nPreference Retrieval (Top-10):")
+        print(f"  Precision: {report['preference_retrieval']['precision@k']:.4f}")
+        print(f"  Recall: {report['preference_retrieval']['recall@k']:.4f}")
+        print(f"  F1: {report['preference_retrieval']['f1@k']:.4f}")
+        
+        print(f"\nZero-Shot Inference:")
+        print(f"  Precision: {report['zero_shot_inference']['precision']:.4f}")
+        print(f"  Recall: {report['zero_shot_inference']['recall']:.4f}")
+        print(f"  F1: {report['zero_shot_inference']['f1']:.4f}")
+        print(f"  AUC: {report['zero_shot_inference']['auc']:.4f}")
+        
+        print(f"\nUser Similarity:")
+        print(f"  Mean Similarity: {report['user_similarity']['mean_similarity']:.4f}")
+        print(f"  Std Similarity: {report['user_similarity']['std_similarity']:.4f}")
+        
+        print(f"\nEmbedding Space:")
+        print(f"  User Embedding Norm: {report['embedding_space']['user_embedding_mean_norm']:.4f}")
+        print(f"  Statement Embedding Norm: {report['embedding_space']['statement_embedding_mean_norm']:.4f}")
+        
+        return report 

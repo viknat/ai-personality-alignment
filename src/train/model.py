@@ -1,222 +1,207 @@
 """
 Universal User Embedding Model Architecture.
 
-This implements the dual-encoder framework described in the paper:
-- User Encoder: Processes user history chunks with attention pooling
-- Statement Encoder: Processes behavioral statements with optional context
-- Both encoders share weights and produce normalized embeddings
+This implements the proper two-tower framework for recommendation systems:
+- User Tower: Separate model for encoding user features/history
+- Item Tower: Separate model for encoding item features/descriptions
+- Both towers map to a shared embedding space for similarity computation
+- No weight sharing between towers - each is optimized for its specific input type
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModel
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any, Union
 import numpy as np
 
 from ..schemas.universal_schema import ModelConfig
 
 
-class AttentionPooling(nn.Module):
-    """Attention-based pooling mechanism for aggregating chunk representations."""
-    
-    def __init__(self, hidden_dim: int, num_heads: int = 8, dropout: float = 0.1):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.num_heads = num_heads
-        self.head_dim = hidden_dim // num_heads
-        
-        self.query = nn.Linear(hidden_dim, hidden_dim)
-        self.key = nn.Linear(hidden_dim, hidden_dim)
-        self.value = nn.Linear(hidden_dim, hidden_dim)
-        self.dropout = nn.Dropout(dropout)
-        self.output_proj = nn.Linear(hidden_dim, hidden_dim)
-        
-    def forward(self, chunk_embeddings: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Args:
-            chunk_embeddings: (batch_size, num_chunks, hidden_dim)
-            attention_mask: (batch_size, num_chunks) - 1 for valid chunks, 0 for padding
-            
-        Returns:
-            pooled_embedding: (batch_size, hidden_dim)
-        """
-        batch_size, num_chunks, hidden_dim = chunk_embeddings.shape
-        
-        # Multi-head attention
-        Q = self.query(chunk_embeddings).view(batch_size, num_chunks, self.num_heads, self.head_dim).transpose(1, 2)
-        K = self.key(chunk_embeddings).view(batch_size, num_chunks, self.num_heads, self.head_dim).transpose(1, 2)
-        V = self.value(chunk_embeddings).view(batch_size, num_chunks, self.num_heads, self.head_dim).transpose(1, 2)
-        
-        # Compute attention scores
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / np.sqrt(self.head_dim)
-        
-        # Apply attention mask if provided
-        if attention_mask is not None:
-            # Expand mask for multi-head attention
-            mask = attention_mask.unsqueeze(1).unsqueeze(1)  # (batch_size, 1, 1, num_chunks)
-            scores = scores.masked_fill(mask == 0, -1e9)
-        
-        # Apply softmax and dropout
-        attention_weights = F.softmax(scores, dim=-1)
-        attention_weights = self.dropout(attention_weights)
-        
-        # Apply attention to values
-        attended = torch.matmul(attention_weights, V)
-        attended = attended.transpose(1, 2).contiguous().view(batch_size, num_chunks, hidden_dim)
-        
-        # Project output
-        output = self.output_proj(attended)
-        
-        # Global pooling: take mean across chunks
-        if attention_mask is not None:
-            # Weighted average based on attention mask
-            mask_expanded = attention_mask.unsqueeze(-1).float()
-            pooled = (output * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1)
-        else:
-            pooled = output.mean(dim=1)
-            
-        return pooled
-
-
-class UniversalUserEmbeddingModel(nn.Module):
+class UserTower(nn.Module):
     """
-    Universal User Embedding Model implementing the dual-encoder architecture.
+    User Tower - encodes user features and history into embeddings.
     
-    This model consists of:
-    1. A shared transformer encoder for both user chunks and statements
-    2. An attention pooling mechanism for aggregating user chunk representations
-    3. L2 normalization for both user and statement embeddings
+    This tower is specifically designed for user data:
+    - User text history (posts, messages, reviews)
+    - User metadata (age, location, preferences)
+    - User behavior patterns
     """
     
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         
-        # Load the base Qwen3 embedding model
-        self.tokenizer = AutoTokenizer.from_pretrained(config.base_model_name)
-        self.transformer = AutoModel.from_pretrained(config.base_model_name)
+        # User-specific tokenizer and model
+        self.tokenizer = AutoTokenizer.from_pretrained(config.user_model_name)
+        self.transformer = AutoModel.from_pretrained(config.user_model_name)
         
-        # Ensure the tokenizer has padding token
+        # Ensure tokenizer has padding token
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-            
-        # Attention pooling for user chunks
-        if config.use_attention_pooling:
-            self.attention_pooling = AttentionPooling(
-                hidden_dim=self.transformer.config.hidden_size,
-                num_heads=config.attention_heads,
-                dropout=config.dropout
-            )
-        else:
-            self.attention_pooling = None
-            
-        # Projection layer to match embedding dimension
-        if self.transformer.config.hidden_size != config.embedding_dim:
-            self.projection = nn.Linear(self.transformer.config.hidden_size, config.embedding_dim)
-        else:
-            self.projection = None
-            
-        # Dropout for regularization
-        self.dropout = nn.Dropout(config.dropout)
         
-    def encode_chunks(self, chunks: List[List[str]], max_length: Optional[int] = None) -> torch.Tensor:
+        # User-specific processing layers
+        self.user_attention_pooling = nn.MultiheadAttention(
+            embed_dim=self.transformer.config.hidden_size,
+            num_heads=config.attention_heads,
+            dropout=config.dropout,
+            batch_first=True
+        )
+        
+        # User metadata processing (if available)
+        if config.use_user_metadata:
+            self.metadata_projection = nn.Linear(config.metadata_dim, self.transformer.config.hidden_size)
+            self.metadata_gate = nn.Sequential(
+                nn.Linear(self.transformer.config.hidden_size * 2, self.transformer.config.hidden_size),
+                nn.Sigmoid()
+            )
+        
+        # Final projection to shared embedding space
+        self.user_projection = nn.Linear(self.transformer.config.hidden_size, config.embedding_dim)
+        self.user_dropout = nn.Dropout(config.dropout)
+        
+    def forward(self, 
+                user_chunks: List[List[str]], 
+                user_metadata: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Encode user chunks into embeddings.
+        Encode user data into embeddings.
         
         Args:
-            chunks: List of chunk texts for each user in the batch
-            max_length: Maximum sequence length for tokenization
+            user_chunks: List of text chunks for each user
+            user_metadata: Optional user metadata tensor (batch_size, metadata_dim)
             
         Returns:
             user_embeddings: (batch_size, embedding_dim) - L2 normalized
         """
-        if max_length is None:
-            max_length = self.config.max_chunk_length
-            
-        batch_size = len(chunks)
-        max_chunks = max(len(user_chunks) for user_chunks in chunks)
+        batch_size = len(user_chunks)
+        max_chunks = max(len(chunks) for chunks in user_chunks)
         
-        # Pad chunks to same length
-        padded_chunks = []
+        # Process text chunks
+        all_chunk_embeddings = []
         attention_masks = []
         
-        for user_chunks in chunks:
-            # Pad with empty strings if needed
-            padded_user_chunks = user_chunks + [""] * (max_chunks - len(user_chunks))
-            padded_chunks.append(padded_user_chunks)
-            
-            # Create attention mask
-            mask = [1] * len(user_chunks) + [0] * (max_chunks - len(user_chunks))
+        for user_chunks_list in user_chunks:
+            # Pad chunks
+            padded_chunks = user_chunks_list + [""] * (max_chunks - len(user_chunks_list))
+            mask = [1] * len(user_chunks_list) + [0] * (max_chunks - len(user_chunks_list))
             attention_masks.append(mask)
+            
+            # Tokenize and encode
+            tokenized = self.tokenizer(
+                padded_chunks,
+                padding=True,
+                truncation=True,
+                max_length=self.config.max_chunk_length,
+                return_tensors="pt"
+            )
+            
+            device = next(self.parameters()).device
+            input_ids = tokenized["input_ids"].to(device)
+            attention_mask = tokenized["attention_mask"].to(device)
+            
+            with torch.no_grad():
+                outputs = self.transformer(input_ids=input_ids, attention_mask=attention_mask)
+                chunk_embeddings = outputs.last_hidden_state[:, 0, :]  # [CLS] token
+            
+            all_chunk_embeddings.append(chunk_embeddings)
         
-        # Flatten for batch processing
-        flat_chunks = [chunk for user_chunks in padded_chunks for chunk in user_chunks]
+        # Stack and apply attention pooling
+        chunk_embeddings = torch.stack(all_chunk_embeddings)  # (batch_size, max_chunks, hidden_dim)
+        attention_masks = torch.tensor(attention_masks, device=chunk_embeddings.device)
         
-        # Tokenize
-        tokenized = self.tokenizer(
-            flat_chunks,
-            padding=True,
-            truncation=True,
-            max_length=max_length,
-            return_tensors="pt"
+        # Apply user-specific attention pooling
+        attended_embeddings, _ = self.user_attention_pooling(
+            chunk_embeddings, chunk_embeddings, chunk_embeddings,
+            key_padding_mask=(attention_masks == 0)
         )
         
-        # Move to device
-        device = next(self.parameters()).device
-        input_ids = tokenized["input_ids"].to(device)
-        attention_mask = tokenized["attention_mask"].to(device)
+        # Global pooling
+        mask_expanded = attention_masks.unsqueeze(-1).float()
+        user_embeddings = (attended_embeddings * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1)
         
-        # Get embeddings from transformer
-        with torch.no_grad():
-            outputs = self.transformer(input_ids=input_ids, attention_mask=attention_mask)
-            chunk_embeddings = outputs.last_hidden_state[:, 0, :]  # Use [CLS] token
+        # Incorporate metadata if available
+        if user_metadata is not None and hasattr(self, 'metadata_projection'):
+            metadata_embeddings = self.metadata_projection(user_metadata)
+            gate = self.metadata_gate(torch.cat([user_embeddings, metadata_embeddings], dim=1))
+            user_embeddings = gate * user_embeddings + (1 - gate) * metadata_embeddings
         
-        # Reshape back to (batch_size, max_chunks, hidden_dim)
-        chunk_embeddings = chunk_embeddings.view(batch_size, max_chunks, -1)
-        attention_masks = torch.tensor(attention_masks, device=device)
-        
-        # Apply attention pooling if enabled
-        if self.attention_pooling is not None:
-            user_embeddings = self.attention_pooling(chunk_embeddings, attention_masks)
-        else:
-            # Simple mean pooling
-            mask_expanded = attention_masks.unsqueeze(-1).float()
-            user_embeddings = (chunk_embeddings * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1)
-        
-        # Apply projection if needed
-        if self.projection is not None:
-            user_embeddings = self.projection(user_embeddings)
-            
-        # Apply dropout and normalize
-        user_embeddings = self.dropout(user_embeddings)
+        # Project to shared embedding space
+        user_embeddings = self.user_projection(user_embeddings)
+        user_embeddings = self.user_dropout(user_embeddings)
         user_embeddings = F.normalize(user_embeddings, p=2, dim=1)
         
         return user_embeddings
+
+
+class ItemTower(nn.Module):
+    """
+    Item Tower - encodes item features and descriptions into embeddings.
     
-    def encode_statements(self, statements: List[str], contexts: Optional[List[str]] = None) -> torch.Tensor:
+    This tower is specifically designed for item data:
+    - Item descriptions, titles, categories
+    - Item metadata (price, brand, features)
+    - Item behavior patterns (views, clicks, purchases)
+    """
+    
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
+        
+        # Item-specific tokenizer and model
+        self.tokenizer = AutoTokenizer.from_pretrained(config.item_model_name)
+        self.transformer = AutoModel.from_pretrained(config.item_model_name)
+        
+        # Ensure tokenizer has padding token
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        
+        # Item-specific processing layers
+        self.item_attention = nn.MultiheadAttention(
+            embed_dim=self.transformer.config.hidden_size,
+            num_heads=config.attention_heads,
+            dropout=config.dropout,
+            batch_first=True
+        )
+        
+        # Item metadata processing (if available)
+        if config.use_item_metadata:
+            self.item_metadata_projection = nn.Linear(config.item_metadata_dim, self.transformer.config.hidden_size)
+            self.item_metadata_gate = nn.Sequential(
+                nn.Linear(self.transformer.config.hidden_size * 2, self.transformer.config.hidden_size),
+                nn.Sigmoid()
+            )
+        
+        # Final projection to shared embedding space
+        self.item_projection = nn.Linear(self.transformer.config.hidden_size, config.embedding_dim)
+        self.item_dropout = nn.Dropout(config.dropout)
+        
+    def forward(self, 
+                item_texts: List[str], 
+                item_metadata: Optional[torch.Tensor] = None,
+                contexts: Optional[List[str]] = None) -> torch.Tensor:
         """
-        Encode behavioral statements into embeddings.
+        Encode item data into embeddings.
         
         Args:
-            statements: List of behavioral statements
-            contexts: Optional list of context strings
+            item_texts: List of item descriptions/statements
+            item_metadata: Optional item metadata tensor (batch_size, item_metadata_dim)
+            contexts: Optional context strings for items
             
         Returns:
-            statement_embeddings: (batch_size, embedding_dim) - L2 normalized
+            item_embeddings: (batch_size, embedding_dim) - L2 normalized
         """
-        # Combine statements with contexts if provided
+        # Combine texts with contexts if provided
         if contexts is not None:
             combined_texts = []
-            for stmt, ctx in zip(statements, contexts):
+            for text, ctx in zip(item_texts, contexts):
                 if ctx:
-                    combined_texts.append(f"{ctx} {stmt}")
+                    combined_texts.append(f"{ctx} {text}")
                 else:
-                    combined_texts.append(stmt)
+                    combined_texts.append(text)
         else:
-            combined_texts = statements
-            
-        # Tokenize
+            combined_texts = item_texts
+        
+        # Tokenize and encode
         tokenized = self.tokenizer(
             combined_texts,
             padding=True,
@@ -225,30 +210,74 @@ class UniversalUserEmbeddingModel(nn.Module):
             return_tensors="pt"
         )
         
-        # Move to device
         device = next(self.parameters()).device
         input_ids = tokenized["input_ids"].to(device)
         attention_mask = tokenized["attention_mask"].to(device)
         
-        # Get embeddings from transformer
         with torch.no_grad():
             outputs = self.transformer(input_ids=input_ids, attention_mask=attention_mask)
-            statement_embeddings = outputs.last_hidden_state[:, 0, :]  # Use [CLS] token
+            item_embeddings = outputs.last_hidden_state[:, 0, :]  # [CLS] token
         
-        # Apply projection if needed
-        if self.projection is not None:
-            statement_embeddings = self.projection(statement_embeddings)
-            
-        # Apply dropout and normalize
-        statement_embeddings = self.dropout(statement_embeddings)
-        statement_embeddings = F.normalize(statement_embeddings, p=2, dim=1)
+        # Apply item-specific attention if we have multiple features
+        if item_metadata is not None and hasattr(self, 'item_metadata_projection'):
+            metadata_embeddings = self.item_metadata_projection(item_metadata)
+            gate = self.item_metadata_gate(torch.cat([item_embeddings, metadata_embeddings], dim=1))
+            item_embeddings = gate * item_embeddings + (1 - gate) * metadata_embeddings
         
-        return statement_embeddings
+        # Project to shared embedding space
+        item_embeddings = self.item_projection(item_embeddings)
+        item_embeddings = self.item_dropout(item_embeddings)
+        item_embeddings = F.normalize(item_embeddings, p=2, dim=1)
+        
+        return item_embeddings
+
+
+class UniversalUserEmbeddingModel(nn.Module):
+    """
+    Universal User Embedding Model implementing proper two-tower architecture.
+    
+    This model consists of:
+    1. Separate User Tower: Optimized for user data processing
+    2. Separate Item Tower: Optimized for item data processing
+    3. Both towers map to a shared embedding space
+    4. No weight sharing - each tower is specialized for its input type
+    """
+    
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
+        
+        # Initialize separate towers
+        self.user_tower = UserTower(config)
+        self.item_tower = ItemTower(config)
+        
+        # Temperature parameter for contrastive learning with bounds
+        # Use log-temperature to prevent gradient explosion: τ = exp(log_τ)
+        self.log_temperature = nn.Parameter(torch.log(torch.tensor(config.temperature)))
+        # Register bounds for gradient clipping: [log(0.01), log(10.0)]
+        self.register_buffer('log_temp_min', torch.log(torch.tensor(0.01)))
+        self.register_buffer('log_temp_max', torch.log(torch.tensor(10.0)))
+    
+    @property
+    def temperature(self):
+        """Get bounded temperature value."""
+        log_temp = torch.clamp(self.log_temperature, self.log_temp_min, self.log_temp_max)
+        return torch.exp(log_temp)
+    
+    def encode_chunks(self, chunks: List[List[str]], user_metadata: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Encode users using the user tower."""
+        return self.user_tower(chunks, user_metadata)
+    
+    def encode_statements(self, statements: List[str], item_metadata: Optional[torch.Tensor] = None, contexts: Optional[List[str]] = None) -> torch.Tensor:
+        """Encode items using the item tower."""
+        return self.item_tower(statements, item_metadata, contexts)
     
     def forward(self, 
                 user_chunks: List[List[str]], 
                 positive_statements: List[str],
                 negative_statements: Optional[List[List[str]]] = None,
+                user_metadata: Optional[torch.Tensor] = None,
+                item_metadata: Optional[torch.Tensor] = None,
                 contexts: Optional[List[str]] = None) -> Dict[str, torch.Tensor]:
         """
         Forward pass for training.
@@ -257,29 +286,32 @@ class UniversalUserEmbeddingModel(nn.Module):
             user_chunks: List of chunk texts for each user
             positive_statements: List of positive statements for each user
             negative_statements: Optional list of negative statements for each user
-            contexts: Optional list of context strings
+            user_metadata: Optional user metadata
+            item_metadata: Optional item metadata
+            contexts: Optional context strings for items
             
         Returns:
             Dictionary containing embeddings and similarity scores
         """
-        # Encode users and positive statements
-        user_embeddings = self.encode_chunks(user_chunks)
-        positive_embeddings = self.encode_statements(positive_statements, contexts)
+        # Encode users and positive items using separate towers
+        user_embeddings = self.encode_chunks(user_chunks, user_metadata)
+        positive_embeddings = self.encode_statements(positive_statements, item_metadata, contexts)
         
         # Compute positive similarities
-        positive_similarities = torch.sum(user_embeddings * positive_embeddings, dim=1)
+        positive_similarities = torch.sum(user_embeddings * positive_embeddings, dim=1) / self.temperature
         
         result = {
             "user_embeddings": user_embeddings,
             "positive_embeddings": positive_embeddings,
-            "positive_similarities": positive_similarities
+            "positive_similarities": positive_similarities,
+            "temperature": self.temperature
         }
         
-        # Encode negative statements if provided
+        # Encode negative items if provided
         if negative_statements is not None:
-            # Flatten negative statements for batch processing
+            # Flatten negative items for batch processing
             flat_negatives = [stmt for user_negs in negative_statements for stmt in user_negs]
-            negative_embeddings = self.encode_statements(flat_negatives)
+            negative_embeddings = self.encode_statements(flat_negatives, item_metadata, contexts)
             
             # Reshape back to (batch_size, num_negatives, embedding_dim)
             num_negatives = len(negative_statements[0])
@@ -289,7 +321,7 @@ class UniversalUserEmbeddingModel(nn.Module):
             negative_similarities = torch.bmm(
                 user_embeddings.unsqueeze(1), 
                 negative_embeddings.transpose(1, 2)
-            ).squeeze(1)
+            ).squeeze(1) / self.temperature
             
             result.update({
                 "negative_embeddings": negative_embeddings,
@@ -298,34 +330,17 @@ class UniversalUserEmbeddingModel(nn.Module):
         
         return result
     
-    def get_user_embedding(self, user_chunks: List[str]) -> torch.Tensor:
-        """
-        Get embedding for a single user.
-        
-        Args:
-            user_chunks: List of text chunks for the user
-            
-        Returns:
-            user_embedding: (embedding_dim,) - L2 normalized
-        """
+    def get_user_embedding(self, user_chunks: List[str], user_metadata: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Get embedding for a single user."""
         self.eval()
         with torch.no_grad():
-            embedding = self.encode_chunks([user_chunks])
+            embedding = self.encode_chunks([user_chunks], user_metadata)
             return embedding.squeeze(0)
     
-    def get_statement_embedding(self, statement: str, context: Optional[str] = None) -> torch.Tensor:
-        """
-        Get embedding for a single statement.
-        
-        Args:
-            statement: Behavioral statement
-            context: Optional context string
-            
-        Returns:
-            statement_embedding: (embedding_dim,) - L2 normalized
-        """
+    def get_statement_embedding(self, statement: str, item_metadata: Optional[torch.Tensor] = None, context: Optional[str] = None) -> torch.Tensor:
+        """Get embedding for a single statement."""
         self.eval()
         with torch.no_grad():
             context_list = [context] if context else None
-            embedding = self.encode_statements([statement], context_list)
+            embedding = self.encode_statements([statement], item_metadata, context_list)
             return embedding.squeeze(0) 

@@ -57,9 +57,12 @@ class BatchData:
 @dataclass
 class ModelConfig:
     """Configuration for the Universal User Embeddings model."""
-    # Model architecture
-    base_model_name: str = "Qwen/Qwen3-Embedding-0.6B"
-    embedding_dim: int = 1024  # Qwen3-Embedding-0.6B output dimension
+    # Model architecture - Two-Tower Configuration
+    user_model_name: str = "Qwen/Qwen3-Embedding-0.6B"  # Separate model for user tower
+    item_model_name: str = "Qwen/Qwen3-Embedding-0.6B"  # Separate model for item tower
+    embedding_dim: int = 1024  # Shared embedding dimension
+    
+    # Input processing
     max_chunk_length: int = 250
     max_statement_length: int = 128
     max_context_length: int = 64
@@ -82,8 +85,17 @@ class ModelConfig:
     attention_heads: int = 8
     dropout: float = 0.1
     
+    # Metadata support
+    use_user_metadata: bool = False
+    use_item_metadata: bool = False
+    metadata_dim: int = 64  # User metadata dimension
+    item_metadata_dim: int = 64  # Item metadata dimension
+    
     # Logging and evaluation
     eval_steps: int = 500
     save_steps: int = 1000
     logging_steps: int = 100
     eval_batch_size: int = 64
+    
+    # Backward compatibility (for existing shared-weight model)
+    base_model_name: str = "Qwen/Qwen3-Embedding-0.6B"  # Legacy field
