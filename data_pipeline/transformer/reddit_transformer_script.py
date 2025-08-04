@@ -32,10 +32,16 @@ def extract_samples(file_path, num_samples_we_want_each_time, prev_ptr, ds_start
         if i >= num_samples_we_want_each_time:
             break
         if line:
-            i = i + 1
             # Append new comment data
             user_id = line.get("user_id")
             text = line.get("content")
+
+            # ignore deleted or bot-generated comments
+            if "I am a bot" in text[0].get("text") or "[deleted]" in text[0].get("text") or "[removed]" in text[0].get("text"):
+                continue
+
+            i = i + 1
+
             user_message_buffer[user_id].append({
                 "speaker": "SELF",
                 "text": text
@@ -80,4 +86,5 @@ def extract_samples(file_path, num_samples_we_want_each_time, prev_ptr, ds_start
 def run(num_samples_we_want_each_time, prev_ptr, ds_start_ptr):
     transformed_comment_samples, curr_ptr, ds_start_ptr = extract_samples("BoqiaoZ/reddit_2M_JSON", num_samples_we_want_each_time, prev_ptr, ds_start_ptr)
     return transformed_comment_samples, curr_ptr, ds_start_ptr
+
 
